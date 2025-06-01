@@ -3,133 +3,178 @@ from Cryptodome.Random import get_random_bytes
 from Cryptodome.Protocol.KDF import scrypt
 import os
 
-def encrypt_aes_gcm(plaintext, password, associated_data=b''):
-    """
-    AES-256-GCM を使用してデータを暗号化します。
-    鍵はパスワードから導出し、安全なランダムなノンスを使用します。
+# 鍵導出のためのパラメータ (本番環境ではより大きなNを推奨)
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
 
-    Args:
-        plaintext (bytes): 暗号化する平文データ。
-        password (str): 鍵を導出するためのパスワード。
-        associated_data (bytes, optional): 暗号化されないが認証される関連データ。デフォルトは空のバイト列。
+def derive_key(password, salt):
+    """パスワードとソルトから鍵を導出します。"""
+    return scrypt(password.encode(), salt, 32, N=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
 
-    Returns:
-        tuple: (salt, nonce, ciphertext, tag)
+def encrypt_chunk(chunk_data, base_key, chunk_index, original_filepath_hint=None):
     """
-    # 鍵導出のためのランダムなソルトを生成 (鍵ストレッチングのため)
-    salt = get_random_bytes(AES.block_size) 
+    データチャンクをAES-256-GCMで暗号化します。
+    各チャンクは独立して暗号化され、固有のノンスとタグを持ちます。
+    """
+    # 各チャンクごとに新しいランダムなノンスを生成
+    nonce = get_random_bytes(AES.block_size) # AES.block_size (16バイト) はGCMのノンスサイズとして一般的
     
-    # scrypt を使用してパスワードから256ビット (32バイト) の鍵を導出
-    # n, r, p はセキュリティパラメータ。強度と処理速度のトレードオフ
-    key = scrypt(password.encode(), salt, 32, N=2**14, r=8, p=1)
+    cipher = AES.new(base_key, AES.MODE_GCM, nonce=nonce)
 
-    # AES-GCM オブジェクトを作成
-    # nonce は暗号化ごとにユニークで予測不可能なものが必要（PyCryptodomeが自動生成）
-    cipher = AES.new(key, AES.MODE_GCM)
+    # 関連データ (AAD) の構築
+    # チャンクインデックスと元のファイルパスのヒントをAADに含めることで、
+    # 復号時にチャンクが正しい順序で、正しいファイルの一部であることを検証する手助けになる。
+    # ただし、これだけではチャンクの欠落や重複を完全に防ぐことはできない。
+    aad_parts = [
+        b"chunk_index:" + str(chunk_index).encode(),
+    ]
+    if original_filepath_hint:
+        aad_parts.append(b"original_filepath:" + original_filepath_hint.encode())
+    
+    associated_data = b";".join(aad_parts) # AADはセミコロンで結合
+    cipher.update(associated_data)
 
-    # 関連データを設定（暗号化はされないが、認証の対象となる）
-    if associated_data:
-        cipher.update(associated_data)
+    ciphertext, tag = cipher.encrypt_and_digest(chunk_data)
 
-    # 平文を暗号化し、認証タグを生成
-    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+    # チャンクごとに保存する情報: ノンス、関連データ、暗号文、タグ
+    # 関連データの長さも一緒に保存すると、復号時に便利
+    chunk_header = (
+        nonce + 
+        len(associated_data).to_bytes(4, 'big') + # 4バイトでAADの長さを保存
+        associated_data
+    )
+    
+    return chunk_header + ciphertext + tag
 
-    return salt, cipher.nonce, ciphertext, tag
-
-def decrypt_aes_gcm(salt, nonce, ciphertext, tag, password, associated_data=b''):
+def decrypt_chunk(encrypted_chunk_data, base_key):
     """
-    AES-256-GCM を使用してデータを復号化します。
-
-    Args:
-        salt (bytes): 鍵導出に使用したソルト。
-        nonce (bytes): 暗号化に使用したノンス。
-        ciphertext (bytes): 暗号文データ。
-        tag (bytes): 認証タグ。
-        password (str): 鍵を導出するためのパスワード。
-        associated_data (bytes, optional): 暗号化されないが認証される関連データ。暗号化時と同じである必要があります。
-
-    Returns:
-        bytes: 復号化された平文データ。
-    Raises:
-        ValueError: 認証に失敗した場合（データが改ざんされた場合など）。
+    暗号化されたデータチャンクをAES-256-GCMで復号します。
     """
-    # 鍵導出のためのソルトとパスワードから鍵を再導出
-    key = scrypt(password.encode(), salt, 32, N=2**14, r=8, p=1)
+    # ヘッダーからノンス、関連データ長、関連データを読み込む
+    nonce_size = AES.block_size # 16バイト
+    aad_len_size = 4
+    tag_size = 16 # GCMタグは通常16バイト
 
-    # AES-GCM オブジェクトを復号化モードで作成
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    # データが短すぎる場合はエラー
+    if len(encrypted_chunk_data) < nonce_size + aad_len_size + tag_size:
+        raise ValueError("暗号化されたチャンクデータが不正です (短すぎます)。")
 
-    # 関連データを設定（暗号化時と同じ関連データが必要）
-    if associated_data:
-        cipher.update(associated_data)
+    nonce = encrypted_chunk_data[0:nonce_size]
+    aad_len = int.from_bytes(encrypted_chunk_data[nonce_size : nonce_size + aad_len_size], 'big')
+    
+    # AADの長さがデータ範囲外の場合もエラー
+    if len(encrypted_chunk_data) < nonce_size + aad_len_size + aad_len + tag_size:
+        raise ValueError("暗号化されたチャンクデータが不正です (AAD長が不正)。")
 
-    # 暗号文を復号化し、タグを検証
+    associated_data = encrypted_chunk_data[nonce_size + aad_len_size : nonce_size + aad_len_size + aad_len]
+    ciphertext_start_index = nonce_size + aad_len_size + aad_len
+    
+    ciphertext = encrypted_chunk_data[ciphertext_start_index : -tag_size]
+    tag = encrypted_chunk_data[-tag_size:]
+
+    cipher = AES.new(base_key, AES.MODE_GCM, nonce=nonce)
+    cipher.update(associated_data)
+
     try:
         plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-        return plaintext
-    except ValueError:
-        raise ValueError("認証に失敗しました。データが改ざんされた可能性があります。")
+        return plaintext, associated_data # 復号された平文とAADを返す
+    except ValueError as e:
+        raise ValueError(f"チャンクの認証に失敗しました。データが改ざんされた可能性があります: {e}")
 
 # --- 使用例 ---
 if __name__ == "__main__":
-    original_plaintext = b"これはAES-256-GCMで暗号化される非常に機密性の高いメッセージです。"
-    user_password = "MyStrongPassword123!"
+    original_file_path = "large_document.txt"
+    output_dir = "encrypted_chunks"
+    decrypted_file_path = "reconstructed_document.txt"
+    password = "MySecurePasswordForChunks!"
     
-    # 関連データ (例: ファイル名、タイムスタンプなど)
-    # これは暗号化されませんが、認証の対象となります。
-    # 復号時に同じ関連データが提供されない場合、認証に失敗します。
-    aad = b"file_id:document_001;creation_date:2025-06-02"
+    # 仮の大きなファイルを作成
+    with open(original_file_path, "w", encoding="utf-8") as f:
+        f.write("This is a line of text for the large document. " * 100 + "\n")
+        f.write("Another line of data. " * 50 + "\n")
+        f.write("Final line of content." + "\n")
+        for i in range(500): # 1000行のデータを作成
+            f.write(f"Line number {i}: This is some arbitrary data to simulate a large file.\n")
+    
+    os.makedirs(output_dir, exist_ok=True)
 
-    print(f"元の平文: {original_plaintext.decode('utf-8')}")
-    print(f"関連データ (AAD): {aad.decode('utf-8')}")
+    # 鍵は一度生成し、ソルトは安全に保存する必要がある (ここでは簡単のためメモリに保持)
+    base_salt = get_random_bytes(AES.block_size)
+    base_key = derive_key(password, base_salt)
 
-    # 暗号化
-    try:
-        salt, nonce, ciphertext, tag = encrypt_aes_gcm(original_plaintext, user_password, aad)
-        print("\n--- 暗号化結果 ---")
-        print(f"ソルト (hex): {salt.hex()}")
-        print(f"ノンス (hex): {nonce.hex()}")
-        print(f"暗号文 (hex): {ciphertext.hex()}")
-        print(f"認証タグ (hex): {tag.hex()}")
-    except Exception as e:
-        print(f"暗号化中にエラーが発生しました: {e}")
-        exit()
+    print(f"元のファイル: {original_file_path}")
+    print(f"暗号化されたチャンクの保存先: {output_dir}")
 
-    # 復号化（正しい鍵と関連データで）
-    try:
-        decrypted_plaintext = decrypt_aes_gcm(salt, nonce, ciphertext, tag, user_password, aad)
-        print("\n--- 復号化結果 ---")
-        print(f"復号された平文: {decrypted_plaintext.decode('utf-8')}")
-        assert original_plaintext == decrypted_plaintext
-        print("平文が一致しました。")
-    except ValueError as e:
-        print(f"\n復号化エラー: {e}")
-    except Exception as e:
-        print(f"\n予期せぬエラー: {e}")
+    # --- 暗号化フェーズ ---
+    chunk_size = 1024 # 1KB ごとのチャンク
+    encrypted_chunk_filenames = []
+    chunk_index = 0
 
-    print("\n--- 認証失敗のテスト (関連データ改ざん) ---")
-    # 復号化（関連データを改ざんした場合）
-    tampered_aad = b"file_id:document_001;creation_date:2025-06-03" # 変更されたAAD
-    try:
-        print(f"改ざんされた関連データ (AAD): {tampered_aad.decode('utf-8')}")
-        decrypt_aes_gcm(salt, nonce, ciphertext, tag, user_password, tampered_aad)
-    except ValueError as e:
-        print(f"復号化エラー（想定通り）: {e}")
+    with open(original_file_path, 'rb') as f_orig:
+        while True:
+            chunk = f_orig.read(chunk_size)
+            if not chunk:
+                break
+            
+            encrypted_data_block = encrypt_chunk(chunk, base_key, chunk_index, original_file_path)
+            
+            # 各チャンクを独立したファイルとして保存
+            chunk_filename = os.path.join(output_dir, f"chunk_{chunk_index:05d}.enc")
+            with open(chunk_filename, 'wb') as f_chunk:
+                f_chunk.write(encrypted_data_block)
+            
+            encrypted_chunk_filenames.append(chunk_filename)
+            chunk_index += 1
+            print(f"チャンク {chunk_index} を暗号化し保存しました。")
+    
+    print(f"\n{chunk_index} 個のチャンクが暗号化され、'{output_dir}' に保存されました。")
 
-    print("\n--- 認証失敗のテスト (暗号文改ざん) ---")
-    # 復号化（暗号文を改ざんした場合）
-    tampered_ciphertext = ciphertext[:-5] + b'abcde' # 暗号文の一部を変更
-    try:
-        print(f"改ざんされた暗号文 (hex): {tampered_ciphertext.hex()}")
-        decrypt_aes_gcm(salt, nonce, tampered_ciphertext, tag, user_password, aad)
-    except ValueError as e:
-        print(f"復号化エラー（想定通り）: {e}")
+    # --- 復号化フェーズ ---
+    print(f"\n暗号化されたチャンクを復号し、'{decrypted_file_path}' に再構築します。")
+    reconstructed_data = b""
+    
+    for i, chunk_filename in enumerate(encrypted_chunk_filenames):
+        try:
+            with open(chunk_filename, 'rb') as f_chunk:
+                encrypted_data_block = f_chunk.read()
+            
+            decrypted_chunk, aad_from_chunk = decrypt_chunk(encrypted_data_block, base_key)
+            
+            # AADからチャンクインデックスを検証（オプションだが推奨）
+            expected_aad_prefix = b"chunk_index:" + str(i).encode()
+            if not aad_from_chunk.startswith(expected_aad_prefix):
+                print(f"警告: チャンク {i} のAADが期待値と異なります。改ざんの可能性があります。")
+                # 必要に応じてエラーを発生させる
+            
+            reconstructed_data += decrypted_chunk
+            print(f"チャンク {i} を復号しました。")
 
-    print("\n--- 認証失敗のテスト (タグ改ざん) ---")
-    # 復号化（タグを改ざんした場合）
-    tampered_tag = tag[:-5] + b'abcde' # タグの一部を変更
-    try:
-        print(f"改ざんされたタグ (hex): {tampered_tag.hex()}")
-        decrypt_aes_gcm(salt, nonce, ciphertext, tampered_tag, user_password, aad)
-    except ValueError as e:
-        print(f"復号化エラー（想定通り）: {e}")
+        except ValueError as e:
+            print(f"チャンク {i} の復号に失敗しました: {e}")
+            # ここで処理を中断するか、エラーを記録して続行するかを決定
+            break # 例としてここで中断
+        except Exception as e:
+            print(f"チャンク {i} の処理中に予期せぬエラーが発生しました: {e}")
+            break
+
+    with open(decrypted_file_path, 'wb') as f_dec:
+        f_dec.write(reconstructed_data)
+
+    # 元のファイルと再構築されたファイルを比較して検証
+    with open(original_file_path, 'rb') as f_orig:
+        original_content = f_orig.read()
+    
+    if original_content == reconstructed_data:
+        print("\n成功: 再構築されたファイルの内容が元のファイルと一致しました！")
+    else:
+        print("\nエラー: 再構築されたファイルの内容が元のファイルと一致しません。")
+
+    # クリーンアップ
+    print("\nクリーンアップ中...")
+    os.remove(original_file_path)
+    os.remove(decrypted_file_path)
+    for f in encrypted_chunk_filenames:
+        os.remove(f)
+    os.rmdir(output_dir)
+    print("完了。")
