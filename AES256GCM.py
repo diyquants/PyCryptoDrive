@@ -4,7 +4,7 @@ from Cryptodome.Protocol.KDF import scrypt
 import os
 
 # 鍵導出のためのパラメータ (本番環境ではより大きなNを推奨)
-SCRYPT_N = 2**14
+SCRYPT_N = 2**32
 SCRYPT_R = 8
 SCRYPT_P = 1
 

@@ -1,6 +1,6 @@
 # what to do
 ### CryptoMatorに不満があるので、Client-Side Crypto Containerを自作する
-## 1.暗号化アルゴリズムの選定->AES256
+## 1.暗号化アルゴリズムの選定->AES256-GCM
 ## 2.ファイルの分割->情報量最大化->効率を考えて50MB
 ## 3.圧縮アルゴリズムの選定->zstd or lz4
 ## 4.ディレクトリ構造の保管形式(jsonl)と暗号化方式(AES)
