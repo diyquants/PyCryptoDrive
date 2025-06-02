@@ -1,4 +1,0 @@
-{"original_path": "drive/folder1/filename.foo", "chunk_index": 0, "encrypted_chunk_file": "chunk_00000.enc", "original_chunk_hash": "...", "encrypted_chunk_hash": "..."}
-{"original_path": "drive/folder1/filename.foo", "chunk_index": 1, "encrypted_chunk_file": "chunk_00001.enc", "original_chunk_hash": "...", "encrypted_chunk_hash": "..."}
-// ...
-{"original_path": "drive/folder1/filename.foo", "file_hash_overall": "entire_file_sha256_hash", "total_chunks": 5} // ファイル全体のメタデータ行
