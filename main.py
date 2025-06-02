@@ -55,8 +55,11 @@ def compute_sha256(text: str) -> str:
 def jsonl_write(line,fname="dirinfo.json"):
     with open(fname,"a") as h:
         h.write(json.dumps(line)+"\n")
+
+
+
 ##暗号化部分
-def encrypt(file_path,output_dir,password):
+def encrypt(file_path,output_dir,password,master_mode=False):
     base_db={}
     filepath=file_path.split("/")
     filename=filepath[-1]
@@ -65,15 +68,12 @@ def encrypt(file_path,output_dir,password):
     base_db["chunkpath"]=output_dir
     chunkrnd=os.urandom(16)
     chunkbase=compute_sha256(chunkrnd+filename.encode("utf-8")+chunkrnd)
-
-
-
     
     #ソルトはbasekeyの生成に必要なのでパスワードと一緒に保存する必要がある
     base_salt = get_random_bytes(AES.block_size)
     base_db["base_salt"]=base_salt.hex()
     base_key = derive_key(password, base_salt)
-    chunk_size = 1024*1024*5 # 50MB ごとのチャンク
+    chunk_size = 1024*1024*50 # 50MB ごとのチャンク
     encrypted_chunk_filenames = []
     chunk_index = 0
 
@@ -92,14 +92,19 @@ def encrypt(file_path,output_dir,password):
             # 各チャンクを独立したファイルとして保存
             nfname=f"{chunkbase}_{chunk_index:05d}"
             fname=compute_sha256(nfname.encode("utf-8"))
+            if master_mode:
+                fname="masterkey"
             chunk_filename = os.path.join(output_dir, f"{fname}.enc")
             with open(chunk_filename, 'wb') as f_chunk:
                 f_chunk.write(encrypted_data_block)
-            chunkdb=base_db.copy()
-            chunkdb["chunk_id"]=chunk_index
-            chunkdb["chunk_name"]=chunk_filename
-            jsonl_write(chunkdb)
-            chunk_index += 1
+            if master_mode:
+                return base_salt.hex()
+            else:
+                chunkdb=base_db.copy()
+                chunkdb["chunk_id"]=chunk_index
+                chunkdb["chunk_name"]=chunk_filename
+                jsonl_write(chunkdb)
+                chunk_index += 1
 
     return 0
 
@@ -155,13 +160,18 @@ if __name__ == '__main__':
     output_dir="."
     target_dir="."
     master_password="1234"
-    for path in traverse_iterative(target_dir):#ディレクトリ指定？
+    paths=[path for path in traverse_iterative(target_dir) if os.path.isfile(path)]
+    for path in paths:
         file_password=gen_rndstring.generate_random_string(120)
         encrypt(path,output_dir,file_password)
-        #data=encrypt("./requirements.txt",".","1234")
     
     #最後にdirinfo.jsonをmaster_password(password)で暗号化して終了
-    master_encryption(dirinfo.json)
-    os.remove("dirinfo.json")
+    master_salt=encrypt("dirinfo.json",output_dir,master_password,True)
+    os.remove("dirinfo.json")#ここは3回のやつに切り替える
+    with open("master_salt.txt","w") as h:
+        h.write(master_salt)
+    
+
+    ##復号化はここから
     #print(decrypt([x for x in data["chunkinfo"]],"./requirements2.txt","1234",data["base_salt"]))
     
